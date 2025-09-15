@@ -87,7 +87,7 @@ Verification flow:
 
 - Incoming messages are parsed and normalized (phone numbers are digits-only)
 - Stored in Redis per-number list key: `<REDIS_INBOUND_LIST>:<number>`
-  - Example: `whatsapp:inbound:list:919316318214`
+  - Example: `whatsapp:inbound:list:919216598210`
 - Fetching messages reads from that per-number list
 
 ## API endpoints
