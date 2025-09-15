@@ -190,16 +190,6 @@ Meta sends a payload similar to:
 
 Our server normalizes and stores it under `whatsapp:inbound:list:919316318214`.
 
-## Logging
-
-- Send flow logs:
-  - `whatsapp.request`, `whatsapp.response`, `whatsapp.send start/success`
-- Webhook flow logs:
-  - `webhook.parse start/done`, `webhook.store success`, `api.webhook receive`
-- Fetch flow logs:
-  - `messages.fetch success number=... count=... limit=...`
-
-All logs print to stdout (configure external collectors as needed).
 
 ## Troubleshooting
 
