@@ -1,4 +1,4 @@
-```markdown
+
 # WhatsApp Cloud API – FastAPI Server
 
 Minimal FastAPI service for WhatsApp Cloud API with two core operations:
@@ -188,4 +188,3 @@ Meta sends a payload similar to:
     }
   ]
 }
-```
