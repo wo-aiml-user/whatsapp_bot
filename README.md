@@ -1,17 +1,20 @@
+```markdown
 # WhatsApp Cloud API – FastAPI Server
 
 Minimal FastAPI service for WhatsApp Cloud API with two core operations:
 - Send message: Client App → POST /send → WhatsApp Cloud API → User
-- Receive message: User → WhatsApp → Webhook → FastAPI /webhook → Redis → Client fetches via POST /get
+- Receive message: User → WhatsApp → Webhook → FastAPI /webhook → MongoDB → Client fetches via POST /get
 
 Logging is enabled for sending and receiving flows.
 
 ## Features
 
 - Send text messages via WhatsApp Cloud API
-- Receive inbound messages via webhook and store in Redis per phone number
+- Send pre-approved template messages (default: 'hello_world')
+- Receive inbound messages via webhook and store in MongoDB per phone number
 - Fetch messages by phone number (with optional limit)
 - Structured logs to stdout for requests, responses, and storage/fetch
+- Integration with Google Gemini LLM for generating conversational responses
 
 ## Prerequisites
 
@@ -20,9 +23,10 @@ Logging is enabled for sending and receiving flows.
 3. System User Access Token with WhatsApp permissions
 4. Phone Number ID and (optionally) Business Account ID
 5. Python 3.10+
-6. Redis (local Docker or service)
+6. MongoDB (local Docker or service)
+7. Google API Key for Gemini LLM
 
-## Quick start
+## Quick Start
 
 1) Install dependencies
 ```bash
@@ -35,34 +39,32 @@ ACCESS_TOKEN=YOUR_GRAPH_ACCESS_TOKEN
 PHONE_NUMBER_ID=YOUR_PHONE_NUMBER_ID
 BUSINESS_ACCOUNT_ID=YOUR_WABA_ID
 GRAPH_API_BASE=https://graph.facebook.com/v22.0
-
-# Webhook verification token (set the same in Meta Developer dashboard)
-VERIFY_TOKEN=MY_VERIFY_TOKEN
-
-# Redis
-REDIS_URL=redis://localhost:6379/0
-REDIS_INBOUND_LIST=whatsapp:inbound:list
+VERIFY_TOKEN=YOUR_VERIFY_TOKEN
+MONGO_URI=mongodb://localhost:27017
+DATABASE_NAME=chat_db
+COLLECTION_NAME=user_chat
+GOOGLE_API_KEY=YOUR_GOOGLE_API_KEY
 ```
 
-3) Run Redis
+3) Run MongoDB
 - Docker (recommended):
 ```bash
-docker run -d --name redis -p 6379:6379 redis:7-alpine
+docker run -d --name mongo -p 27017:27017 mongo:6
 ```
-- Native (Windows): use Memurai or Redis for Windows alternatives.
+- Native (Windows): Use MongoDB Community Edition or compatible alternatives.
 
 4) Run the API
 ```bash
 uvicorn src.main:app --reload
 ```
 
-## Exposing webhook (ngrok or alternatives)
+## Exposing Webhook (ngrok or alternatives)
 
 The webhook must be reachable from Meta. Use a tunnel for local development:
 
 - ngrok
 ```bash
-ngrok http 8000
+ngrok http 8080
 ```
 Take the HTTPS URL (e.g., https://abc123.ngrok.io). Your webhook endpoints will be:
 - Verification: GET https://abc123.ngrok.io/webhook
@@ -70,7 +72,7 @@ Take the HTTPS URL (e.g., https://abc123.ngrok.io). Your webhook endpoints will 
 
 Alternatives: `cloudflared tunnel`, `localtunnel`, etc.
 
-## WhatsApp Cloud API setup (Meta dashboard)
+## WhatsApp Cloud API Setup (Meta Dashboard)
 
 1. Go to Meta Developers → Your App → WhatsApp → Configuration
 2. Set Callback URL: your public `/webhook` URL (e.g., https://abc123.ngrok.io/webhook)
@@ -83,51 +85,43 @@ Verification flow:
   - hub.mode=subscribe, hub.verify_token=YOUR_TOKEN, hub.challenge=random
 - Server validates token and returns `hub.challenge` with 200 OK
 
-## Data model and storage
+## Data Model and Storage
 
 - Incoming messages are parsed and normalized (phone numbers are digits-only)
-- Stored in Redis per-number list key: `<REDIS_INBOUND_LIST>:<number>`
-  - Example: `whatsapp:inbound:list:919216598210`
-- Fetching messages reads from that per-number list
+- Stored in MongoDB in the specified database and collection
+- Messages include: id, from, to, timestamp, type, body, and raw payload
+- Fetching messages retrieves from MongoDB by phone number, sorted by timestamp (newest first)
 
-## API endpoints
+## API Endpoints
 
 ### POST /send
-Send a text message to a user.
+Send a text message or template message to a user. If no conversation history exists or no recent user message is found, sends a template message. Otherwise, generates an LLM response based on the latest user message.
 
 Request JSON:
 ```json
 {
-  "number": "919216598210",
-  "text": "Hello from FastAPI"
+  "number": "919216598210"
 }
 ```
 
 Responses:
-- 200 OK on success (includes WhatsApp response)
+- 200 OK on success (includes WhatsApp response, indicates if template was used)
 - 400 Bad Request on WhatsApp API errors
+- 500 Internal Server Error on LLM processing errors
 
-Sample cURL (PowerShell users see below):
+Sample cURL:
 ```bash
-curl -X POST http://localhost:8000/send \
+curl -X POST http://localhost:8080/send \
   -H "Content-Type: application/json" \
-  -d '{"number":"919216598210","text":"Hello"}'
+  -d '{"number":"919216598210"}'
 ```
 
 PowerShell:
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:8000/send" `
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/send" `
   -ContentType "application/json" `
-  -Body '{"number":"919216598210","text":"Hello"}'
+  -Body '{"number":"919216598210"}'
 ```
-
-### POST /webhook
-Receives incoming messages from WhatsApp (Meta). Parses and stores messages to Redis per number.
-
-You do not call this directly; Meta calls it after configuration and subscription.
-
-### GET /webhook (verification)
-Meta calls this once when you press Verify. The server checks `VERIFY_TOKEN` and echoes the challenge.
 
 ### POST /get
 Fetch messages for a specific number (digits-only or with `+`, both accepted).
@@ -136,10 +130,10 @@ Request JSON:
 ```json
 {
   "number": "+919216598210",
-  "limit": 0
+  "limit": 20
 }
 ```
-- `limit` = 0 (or omitted) returns all available messages for that number
+- `limit` = 0 returns all available messages; otherwise, limits to specified number
 
 Response JSON:
 ```json
@@ -159,7 +153,15 @@ Response JSON:
 }
 ```
 
-## Example webhook payload (inbound message)
+### GET /webhook (Verification)
+Meta calls this once during webhook setup. The server checks `VERIFY_TOKEN` and echoes the challenge.
+
+### POST /webhook
+Receives incoming messages from WhatsApp (Meta). Parses and stores messages in MongoDB.
+
+You do not call this directly; Meta calls it after configuration and subscription.
+
+## Example Webhook Payload (Inbound Message)
 
 Meta sends a payload similar to:
 ```json
@@ -187,22 +189,3 @@ Meta sends a payload similar to:
   ]
 }
 ```
-
-Our server normalizes and stores it under `whatsapp:inbound:list:919316318214`.
-
-
-## Troubleshooting
-
-- 401/403 during webhook verify: Ensure `VERIFY_TOKEN` matches dashboard, use current public URL
-- 200 OK but zero messages when fetching:
-  - Ensure you are posting to `/get` (POST, not GET)
-  - Use digits-only number or include `+` (server normalizes internally)
-  - Verify Redis is running and `REDIS_URL` is correct
-  - Check logs for `webhook.store success` and `messages.fetch success`
-- WhatsApp API errors when sending:
-  - Verify `ACCESS_TOKEN` and `PHONE_NUMBER_ID`
-  - Respect 24-hour user-initiated session window
-
-## License
-
-This project is provided as-is for development purposes. Ensure compliance with WhatsApp and Meta API policies.

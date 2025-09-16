@@ -1,8 +1,4 @@
-"""
- WhatsApp Business API client for two core flows:
-- Sending text messages to users
-- Receiving webhook events and storing messages, then fetching them
-"""
+
 
 import os
 import requests
@@ -10,6 +6,8 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.collection import Collection
 
 # Load environment variables
 load_dotenv('config.env')
@@ -19,11 +17,30 @@ ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
 PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
 GRAPH_API_BASE = os.getenv('GRAPH_API_BASE', 'https://graph.facebook.com/v22.0')
 
-# Redis configuration (optional if using webhook storage)
-REDIS_URL = os.getenv('REDIS_URL')
-REDIS_INBOUND_LIST = os.getenv('REDIS_INBOUND_LIST', 'whatsapp:inbound:list')
+# MongoDB configuration
+MONGO_URI = os.getenv('MONGO_URI')
+DATABASE_NAME = os.getenv('DATABASE_NAME', 'chat_db')
+COLLECTION_NAME = os.getenv('COLLECTION_NAME', 'user_chat')
 
-# Logger
+_mongo_client: Optional[MongoClient] = None
+_mongo_collection: Optional[Collection] = None
+
+
+def _get_collection() -> Optional[Collection]:
+    global _mongo_client, _mongo_collection
+    if _mongo_collection is not None:
+        return _mongo_collection
+    if not MONGO_URI:
+        logger.warning("MongoDB not configured: MONGO_URI missing")
+        return None
+    try:
+        _mongo_client = MongoClient(MONGO_URI)
+        _mongo_collection = _mongo_client[DATABASE_NAME][COLLECTION_NAME]
+        return _mongo_collection
+    except Exception as e:
+        logger.error("mongo.connect error=%s", str(e))
+        return None
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -38,21 +55,18 @@ class WhatsAppAPIError(Exception):
     pass
 
 
-def _normalize_number(number: Optional[str]) -> Optional[str]:
-    """Normalize phone numbers by keeping digits only (drops leading '+', spaces, etc)."""
-    if not number:
-        return number
-    try:
-        digits = ''.join(ch for ch in str(number) if ch.isdigit())
-        return digits
-    except Exception:
-        return number
-
-
 def _make_request(method: str, url: str, headers: Dict[str, str], data: Optional[Dict] = None) -> Dict[str, Any]:
     """Make HTTP request to WhatsApp API with error handling and logging"""
     try:
-        logger.info("whatsapp.request start method=%s url=%s", method, url)
+        safe_headers = dict(headers)
+        if "Authorization" in safe_headers:
+            safe_headers["Authorization"] = "***REDACTED***"
+        logger.info("whatsapp.request start method=%s url=%s headers=%s", method, url, safe_headers)
+        if data is not None:
+            try:
+                logger.info("whatsapp.request payload=%s", json.dumps(data))
+            except Exception:
+                logger.info("whatsapp.request payload(non-serializable)")
         if method.upper() == 'GET':
             response = requests.get(url, headers=headers)
         elif method.upper() == 'POST':
@@ -63,7 +77,10 @@ def _make_request(method: str, url: str, headers: Dict[str, str], data: Optional
         logger.info("whatsapp.response status=%s", response.status_code)
         response.raise_for_status()
         payload = response.json()
-        logger.info("whatsapp.response ok keys=%s", list(payload.keys()))
+        try:
+            logger.info("whatsapp.response payload=%s", json.dumps(payload))
+        except Exception:
+            logger.info("whatsapp.response payload(non-serializable)")
         return payload
     except requests.exceptions.RequestException as e:
         logger.error("whatsapp.request error=%s", str(e))
@@ -82,14 +99,13 @@ def send_message_text(to_number: str, message: str) -> Dict[str, Any]:
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
-    to_number_norm = _normalize_number(to_number)
     body = {
         "messaging_product": "whatsapp",
-        "to": to_number_norm,
+        "to": to_number,
         "type": "text",
         "text": {"body": message}
     }
-    logger.info("whatsapp.send start to=%s normalized=%s", to_number, to_number_norm)
+    logger.info("whatsapp.send start (text) to=%s body=%s", to_number, message)
     result = _make_request('POST', url, headers, body)
     logger.info("whatsapp.send success message_id=%s", (result.get('messages', [{}])[0].get('id') if isinstance(result.get('messages'), list) else None))
     return result
@@ -99,7 +115,44 @@ def send_text_message(to_number: str, message: str) -> Dict[str, Any]:
     return send_message_text(to_number, message)
 
 
-# removed: send_media_message and other non-core operations
+def send_template_message(
+    to_number: str,
+    template_name: str = "hello_world",
+    language_code: str = "en_US",
+    components: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Send a template message using a pre-approved template.
+    Default sends the standard 'hello_world' template.
+    """
+    if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        raise WhatsAppAPIError("ACCESS_TOKEN and PHONE_NUMBER_ID must be set in environment")
+
+    url = f"{GRAPH_API_BASE}/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    body: Dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code},
+        },
+    }
+    if components:
+        body["template"]["components"] = components
+
+    logger.info("whatsapp.send_template start to=%s template=%s body=%s", to_number, template_name, body)
+    result = _make_request("POST", url, headers, body)
+    logger.info(
+        "whatsapp.send_template success message_id=%s",
+        (result.get("messages", [{}])[0].get("id") if isinstance(result.get("messages"), list) else None),
+    )
+    return result
+
 
 
 # Webhook handling helpers
@@ -108,6 +161,10 @@ def handle_webhook_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     Parse WhatsApp webhook payload into a list of message dicts.
     Each message dict minimally contains: from, to, timestamp, type, body, id, chat_id
     """
+    try:
+        logger.info("webhook.receive raw_payload=%s", json.dumps(payload))
+    except Exception:
+        logger.info("webhook.receive raw_payload(non-serializable)")
     logger.info("webhook.parse start")
     messages: List[Dict[str, Any]] = []
     entry_list = payload.get("entry", [])
@@ -120,7 +177,7 @@ def handle_webhook_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             metadata = value.get("metadata", {})
             to_phone = metadata.get("display_phone_number") or metadata.get("phone_number_id")
             for i, msg in enumerate(msgs):
-                from_ = _normalize_number(msg.get("from"))
+                from_ = msg.get("from")
                 msg_id = msg.get("id")
                 timestamp = msg.get("timestamp")
                 msg_type = msg.get("type")
@@ -135,95 +192,95 @@ def handle_webhook_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 messages.append({
                     "id": msg_id,
                     "from": from_,
-                    "to": _normalize_number(to_phone),
+                    "to": to_phone,
                     "timestamp": timestamp,
                     "type": msg_type,
                     "body": body,
                     "raw": msg
                 })
-    logger.info("webhook.parse done count=%s", len(messages))
+    try:
+        logger.info("webhook.parse done count=%s messages=%s", len(messages), json.dumps(messages))
+    except Exception:
+        logger.info("webhook.parse done count=%s (messages non-serializable)", len(messages))
     return messages
 
 
 def store_inbound_messages(messages: List[Dict[str, Any]]) -> int:
-    """Store inbound messages into Redis under per-number lists. Returns number stored."""
-    if not REDIS_URL:
+    """Store inbound messages into MongoDB. Returns number stored."""
+    collection = _get_collection()
+    if collection is None:
         return 0
     try:
-        import redis
-        client = redis.from_url(REDIS_URL, decode_responses=True)
-        count = 0
+        docs: List[Dict[str, Any]] = []
         for m in messages:
-            number = _normalize_number(m.get("from") or m.get("to"))
-            if not number:
-                logger.warning("webhook.store skip message without number")
+            from_number = m.get("from")
+            to_number = m.get("to")
+            if not from_number and not to_number:
+                logger.warning("webhook.store skip message without addresses")
                 continue
-            key = f"{REDIS_INBOUND_LIST}:{number}"
-            client.lpush(key, json.dumps(m))
-            count += 1
-        logger.info("webhook.store success stored=%s", count)
+            doc = dict(m)
+            doc["from"] = from_number
+            doc["to"] = to_number
+            doc["participant_numbers"] = [n for n in [from_number, to_number] if n]
+            docs.append(doc)
+        if not docs:
+            return 0
+        try:
+            logger.info("mongo.insert_many docs=%s", json.dumps(docs))
+        except Exception:
+            logger.info("mongo.insert_many docs(non-serializable)")
+        result = collection.insert_many(docs)
+        count = len(result.inserted_ids)
+        logger.info("webhook.store(mongo) success stored=%s", count)
         return count
     except Exception as e:
-        logger.error("webhook.store error=%s", str(e))
+        logger.error("webhook.store(mongo) error=%s", str(e))
         return 0
 
 
 def fetch_latest_messages(limit: int = 20) -> List[Dict[str, Any]]:
-    """Deprecated: Fetches from legacy flat list if present (kept for compatibility)."""
-    if not REDIS_URL:
+    """Fetch latest messages across collection (primarily for diagnostics)."""
+    collection = _get_collection()
+    if collection is None:
         return []
     try:
-        import redis
-        client = redis.from_url(REDIS_URL, decode_responses=True)
-        if limit is None or limit <= 0:
-            items = client.lrange(REDIS_INBOUND_LIST, 0, -1)
-        else:
-            items = client.lrange(REDIS_INBOUND_LIST, 0, max(0, limit - 1))
-        result: List[Dict[str, Any]] = []
-        for item in items:
-            try:
-                result.append(json.loads(item))
-            except Exception:
-                continue
-        logger.info("messages.fetch(legacy) success count=%s limit=%s", len(result), limit)
-        return result
+        cursor = collection.find({}, sort=[("timestamp", -1)])
+        if limit and limit > 0:
+            cursor = cursor.limit(limit)
+        results = [
+            {k: v for k, v in doc.items() if k != "_id"}
+            for doc in cursor
+        ]
+        try:
+            logger.info("messages.fetch_latest(mongo) success count=%s limit=%s results=%s", len(results), limit, json.dumps(results))
+        except Exception:
+            logger.info("messages.fetch_latest(mongo) success count=%s limit=%s (results non-serializable)", len(results), limit)
+        return results
     except Exception as e:
-        logger.error("messages.fetch error=%s", str(e))
+        logger.error("messages.fetch_latest(mongo) error=%s", str(e))
         return []
 
 
 def fetch_messages_by_number(number: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """Fetch inbound messages for a specific phone number. If limit <= 0, return all."""
-    if not REDIS_URL:
+    """Fetch messages for a specific phone number from MongoDB. Newest first. If limit <= 0, return all."""
+    collection = _get_collection()
+    if collection is None:
         return []
     try:
-        import redis
-        client = redis.from_url(REDIS_URL, decode_responses=True)
-        number_norm = _normalize_number(number)
-        key = f"{REDIS_INBOUND_LIST}:{number_norm}"
-        if limit is None or limit <= 0:
-            items = client.lrange(key, 0, -1)
-        else:
-            items = client.lrange(key, 0, max(0, limit - 1))
-        result: List[Dict[str, Any]] = []
-        for item in items:
-            try:
-                result.append(json.loads(item))
-            except Exception:
-                continue
-        logger.info("messages.fetch success number=%s normalized=%s count=%s limit=%s", number, number_norm, len(result), limit)
-        return result
+        query = {"participant_numbers": number}
+        logger.info("messages.fetch(mongo) query=%s", json.dumps(query))
+        cursor = collection.find(query, sort=[("timestamp", -1)])
+        if limit and limit > 0:
+            cursor = cursor.limit(limit)
+        results = [
+            {k: v for k, v in doc.items() if k != "_id"}
+            for doc in cursor
+        ]
+        try:
+            logger.info("messages.fetch(mongo) success number=%s count=%s limit=%s results=%s", number, len(results), limit, json.dumps(results))
+        except Exception:
+            logger.info("messages.fetch(mongo) success number=%s count=%s limit=%s (results non-serializable)", number, len(results), limit)
+        return results
     except Exception as e:
-        logger.error("messages.fetch error number=%s error=%s", number, str(e))
+        logger.error("messages.fetch(mongo) error number=%s error=%s", number, str(e))
         return []
-
-
-
-
- 
-
-
- 
-
-
- 
