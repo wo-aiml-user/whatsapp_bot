@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -85,31 +84,34 @@ def generate_response(user_message: str, phone_number: str) -> str:
 def auto_respond_to_message(from_number: str, message_body: str) -> None:
     """
     Automatically generate and send a response to an incoming message.
-    This function checks message history BEFORE the current message was stored.
+    Logic:
+    - If this is the very first user message (no prior user messages in DB) → send template.
+    - Otherwise → respond with LLM.
     """
     try:
         logger.info("auto_respond start from=%s message=%s", from_number, message_body)
+
         history = fetch_messages_by_number(from_number, 0)
-        user_message_count = 0
-        for msg in history:
-            msg_from = msg.get("from")
-            if msg_from and str(msg_from) == from_number:
-                user_message_count += 1
-        
-        logger.info("auto_respond user_message_count=%s for from_number=%s", user_message_count, from_number)
+
+        prior_user_messages = [
+            msg for msg in history
+            if msg.get("from") == str(from_number)
+            and msg.get("type") in ["text", "button", "interactive"]
+        ]
+        user_message_count = len(prior_user_messages)
+
+        logger.info("auto_respond found prior_user_messages=%s for from_number=%s",
+                    user_message_count, from_number)
+
         if user_message_count == 0:
             logger.info("sending template (first contact) to=%s", from_number)
-            resp = send_template_message(from_number)
-            logger.info("auto_respond success (template) to=%s", from_number)
+            send_template_message(from_number)
         else:
-            logger.info("generating llm response to message from=%s (previous_message_count=%s)", from_number, user_message_count)
+            logger.info("generating llm response for from=%s", from_number)
             llm_response = generate_response(message_body, from_number)
-            logger.info("sending llm response to=%s body=%s", from_number, llm_response)
-            resp = send_text_message(from_number, llm_response)
-            logger.info("auto_respond success (llm) to=%s", from_number)
-            
+            send_text_message(from_number, llm_response)
+
     except WhatsAppAPIError as e:
         logger.error("auto_respond whatsapp error from=%s error=%s", from_number, str(e))
     except Exception as e:
         logger.error("auto_respond general error from=%s error=%s", from_number, str(e))
-

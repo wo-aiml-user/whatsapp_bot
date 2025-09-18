@@ -153,6 +153,9 @@ async def webhook_receive(request: Request):
     
     msgs = handle_webhook_event(payload)
     
+    stored = store_inbound_messages(msgs)
+    logger.info("stored messages count=%s", stored)
+    
     for msg in msgs:
         msg_type = msg.get("type")
         from_number = msg.get("from")
@@ -164,9 +167,6 @@ async def webhook_receive(request: Request):
             auto_respond_to_message(from_number, message_body)
         else:
             logger.info("ignoring non-message webhook event type=%s from=%s", msg_type, from_number)
-    
-    stored = store_inbound_messages(msgs)
-    logger.info("stored messages count=%s", stored)
     
     logger.info("api.webhook receive done received=%s stored=%s", len(msgs), stored)
     return JSONResponse({"received": len(msgs), "stored": stored})
