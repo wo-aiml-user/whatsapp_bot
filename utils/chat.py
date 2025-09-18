@@ -9,9 +9,9 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 
 from .model_config import get_llm
-from src.whatsapp_client import fetch_messages_by_number
+from src.whatsapp_client import fetch_messages_by_number, send_template_message, send_text_message, WhatsAppAPIError
 
-load_dotenv('config.env')
+load_dotenv('.env')
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def generate_response(user_message: str, phone_number: str) -> str:
     Generate a response using the LLM with full conversation history context
     """
     try:
-        history_messages = fetch_messages_by_number(phone_number, 0)  # 0 means no limit
+        history_messages = fetch_messages_by_number(phone_number, 0)
         try:
             logger.info("chat.history raw=%s", json.dumps(history_messages))
         except Exception:
@@ -80,4 +80,36 @@ def generate_response(user_message: str, phone_number: str) -> str:
     except Exception as e:
         logger.error(f"Error generating response: {str(e)}")
         return "I apologize, but I'm having trouble processing your message right now. Please try again later."
+
+
+def auto_respond_to_message(from_number: str, message_body: str) -> None:
+    """
+    Automatically generate and send a response to an incoming message.
+    This function checks message history BEFORE the current message was stored.
+    """
+    try:
+        logger.info("auto_respond start from=%s message=%s", from_number, message_body)
+        history = fetch_messages_by_number(from_number, 0)
+        user_message_count = 0
+        for msg in history:
+            msg_from = msg.get("from")
+            if msg_from and str(msg_from) == from_number:
+                user_message_count += 1
+        
+        logger.info("auto_respond user_message_count=%s for from_number=%s", user_message_count, from_number)
+        if user_message_count == 0:
+            logger.info("sending template (first contact) to=%s", from_number)
+            resp = send_template_message(from_number)
+            logger.info("auto_respond success (template) to=%s", from_number)
+        else:
+            logger.info("generating llm response to message from=%s (previous_message_count=%s)", from_number, user_message_count)
+            llm_response = generate_response(message_body, from_number)
+            logger.info("sending llm response to=%s body=%s", from_number, llm_response)
+            resp = send_text_message(from_number, llm_response)
+            logger.info("auto_respond success (llm) to=%s", from_number)
+            
+    except WhatsAppAPIError as e:
+        logger.error("auto_respond whatsapp error from=%s error=%s", from_number, str(e))
+    except Exception as e:
+        logger.error("auto_respond general error from=%s error=%s", from_number, str(e))
 

@@ -1,20 +1,22 @@
 
 # WhatsApp Cloud API – FastAPI Server
 
-Minimal FastAPI service for WhatsApp Cloud API with two core operations:
-- Send message: Client App → POST /send → WhatsApp Cloud API → User
-- Receive message: User → WhatsApp → Webhook → FastAPI /webhook → MongoDB → Client fetches via POST /get
+Minimal FastAPI service for WhatsApp Cloud API with automated messaging:
+- Initiate conversations: Client App → POST /initiate-bulk → WhatsApp Cloud API → Users
+- Receive & Auto-respond: User → WhatsApp → Webhook → AI Response → User
+- Fetch conversation history: Client App → POST /get → MongoDB
 
-Logging is enabled for sending and receiving flows.
+Logging is enabled for all messaging flows with automatic LLM-powered responses.
 
 ## Features
 
-- Send text messages via WhatsApp Cloud API
-- Send pre-approved template messages (default: 'hello_world')
-- Receive inbound messages via webhook and store in MongoDB per phone number
-- Fetch messages by phone number (with optional limit)
-- Structured logs to stdout for requests, responses, and storage/fetch
-- Integration with Google Gemini LLM for generating conversational responses
+- **Automated Messaging**: Incoming messages trigger automatic AI-powered responses
+- **Conversation Initiation**: Send template messages to start conversations (single or bulk)
+- **Smart Response Logic**: Template messages for new contacts, AI responses for existing conversations
+- **Message Storage**: Store and retrieve conversation history in MongoDB
+- **Structured Logging**: Comprehensive logs for all messaging operations
+- **LLM Integration**: Google Gemini LLM for generating contextual responses
+- **Status Filtering**: Process actual messages while ignoring delivery/read receipts
 
 ## Prerequisites
 
@@ -33,7 +35,11 @@ Logging is enabled for sending and receiving flows.
 pip install -r requirements.txt
 ```
 
-2) Configure environment in `config.env`
+2) Configure environment in `.env` (copy from `.env.example`)
+```bash
+cp .env.example .env
+# Then edit .env with your actual values
+```
 ```ini
 ACCESS_TOKEN=YOUR_GRAPH_ACCESS_TOKEN
 PHONE_NUMBER_ID=YOUR_PHONE_NUMBER_ID
@@ -76,7 +82,7 @@ Alternatives: `cloudflared tunnel`, `localtunnel`, etc.
 
 1. Go to Meta Developers → Your App → WhatsApp → Configuration
 2. Set Callback URL: your public `/webhook` URL (e.g., https://abc123.ngrok.io/webhook)
-3. Set Verify Token: must match `VERIFY_TOKEN` in `config.env`
+3. Set Verify Token: must match `VERIFY_TOKEN` in `.env`
 4. Click Verify; Meta will call GET /webhook with hub params
 5. Subscribe to message fields for your phone number (messages, messages.status as needed)
 
@@ -94,33 +100,56 @@ Verification flow:
 
 ## API Endpoints
 
-### POST /send
-Send a text message or template message to a user. If no conversation history exists or no recent user message is found, sends a template message. Otherwise, generates an LLM response based on the latest user message.
+### POST /initiate-bulk
+Initiate conversations by sending template messages to one or more contacts. Supports both single contact and bulk operations.
 
 Request JSON:
 ```json
 {
-  "number": "919216598210"
+  "numbers": ["919216598210", "919876543210"]
 }
 ```
 
-Responses:
-- 200 OK on success (includes WhatsApp response, indicates if template was used)
-- 400 Bad Request on WhatsApp API errors
-- 500 Internal Server Error on LLM processing errors
+For single contact:
+```json
+{
+  "numbers": ["919216598210"]
+}
+```
+
+Response:
+```json
+{
+  "total": 2,
+  "successful": 1,
+  "failed": 1,
+  "results": [
+    {
+      "number": "919216598210",
+      "success": true,
+      "response": { /* WhatsApp API response */ }
+    },
+    {
+      "number": "919876543210",
+      "success": false,
+      "error": "Invalid phone number"
+    }
+  ]
+}
+```
 
 Sample cURL:
 ```bash
-curl -X POST http://localhost:8080/send \
+curl -X POST http://localhost:8080/initiate-bulk \
   -H "Content-Type: application/json" \
-  -d '{"number":"919216598210"}'
+  -d '{"numbers":["919216598210"]}'
 ```
 
 PowerShell:
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:8080/send" `
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/initiate-bulk" `
   -ContentType "application/json" `
-  -Body '{"number":"919216598210"}'
+  -Body '{"numbers":["919216598210"]}'
 ```
 
 ### POST /get
@@ -153,13 +182,66 @@ Response JSON:
 }
 ```
 
+### POST /get-bulk
+Fetch messages from multiple phone numbers. Supports both single contact and bulk operations.
+
+Request JSON:
+```json
+{
+  "numbers": ["+919216598210", "+919876543210"],
+  "limit": 10
+}
+```
+
+For single contact:
+```json
+{
+  "numbers": ["+919216598210"],
+  "limit": 20
+}
+```
+
+Response JSON:
+```json
+{
+  "total_numbers": 2,
+  "successful": 1,
+  "failed": 1,
+  "total_messages": 5,
+  "results": [
+    {
+      "number": "919216598210",
+      "success": true,
+      "count": 5,
+      "messages": [/* message objects */]
+    },
+    {
+      "number": "919876543210",
+      "success": false,
+      "error": "No messages found",
+      "count": 0,
+      "messages": []
+    }
+  ]
+}
+```
+
 ### GET /webhook (Verification)
 Meta calls this once during webhook setup. The server checks `VERIFY_TOKEN` and echoes the challenge.
 
 ### POST /webhook
-Receives incoming messages from WhatsApp (Meta). Parses and stores messages in MongoDB.
+Receives incoming messages from WhatsApp (Meta). Automatically:
+1. Parses and stores messages in MongoDB
+2. Filters out status updates (read receipts, delivery confirmations)
+3. Generates and sends AI responses for actual text messages
+4. Sends template messages for first-time contacts
 
 You do not call this directly; Meta calls it after configuration and subscription.
+
+**Automatic Response Logic:**
+- **New Contact**: Sends template message on first interaction
+- **Existing Contact**: Generates AI response using conversation history
+- **Status Updates**: Logged but ignored (no response sent)
 
 ## Example Webhook Payload (Inbound Message)
 

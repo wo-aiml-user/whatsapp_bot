@@ -10,7 +10,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 
 # Load environment variables
-load_dotenv('config.env')
+load_dotenv('.env')
 
 # Configuration
 ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
@@ -155,11 +155,11 @@ def send_template_message(
 
 
 
-# Webhook handling helpers
 def handle_webhook_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Parse WhatsApp webhook payload into a list of message dicts.
     Each message dict minimally contains: from, to, timestamp, type, body, id, chat_id
+    Filters out status updates and only returns actual messages.
     """
     try:
         logger.info("webhook.receive raw_payload=%s", json.dumps(payload))
@@ -173,9 +173,17 @@ def handle_webhook_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         for change in changes:
             value = change.get("value", {})
             contacts = value.get("contacts", [])
-            msgs = value.get("messages", [])
+            msgs = value.get("messages", []) 
+            statuses = value.get("statuses", [])
             metadata = value.get("metadata", {})
             to_phone = metadata.get("display_phone_number") or metadata.get("phone_number_id")
+            
+            if statuses:
+                logger.info("webhook.parse status_updates count=%s", len(statuses))
+                for status in statuses:
+                    logger.info("webhook.parse status status=%s recipient=%s", 
+                               status.get("status"), status.get("recipient_id"))
+            
             for i, msg in enumerate(msgs):
                 from_ = msg.get("from")
                 msg_id = msg.get("id")
@@ -189,15 +197,21 @@ def handle_webhook_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 elif msg_type == "interactive":
                     interactive = msg.get("interactive", {})
                     body = interactive.get("nfm_reply", {}).get("body") or interactive.get("button_reply", {}).get("title")
-                messages.append({
-                    "id": msg_id,
-                    "from": from_,
-                    "to": to_phone,
-                    "timestamp": timestamp,
-                    "type": msg_type,
-                    "body": body,
-                    "raw": msg
-                })
+                
+                if from_ and body:
+                    messages.append({
+                        "id": msg_id,
+                        "from": from_,
+                        "to": to_phone,
+                        "timestamp": timestamp,
+                        "type": msg_type,
+                        "body": body,
+                        "raw": msg
+                    })
+                    logger.info("webhook.parse added_message from=%s type=%s body=%s", from_, msg_type, body)
+                else:
+                    logger.info("webhook.parse skipped_message type=%s from=%s (no content)", msg_type, from_)
+                    
     try:
         logger.info("webhook.parse done count=%s messages=%s", len(messages), json.dumps(messages))
     except Exception:
